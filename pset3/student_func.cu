@@ -80,52 +80,86 @@
 */
 
 #include "utils.h"
-#include <stdint.h>
 
 __global__ void get_logLum_max_min(const float* const d_logLuminance,
-                       unsigned int max_logLumInt, 
-                       unsigned int  min_logLumInt,
-                       const size_t numRows,
-                       const size_t numCols) {
-    extern __shared__ float sdata_max[];
-    extern __shared__ float sdata_min[];
+                       float* logLumArr, 
+                       const int min_or_max,
+                       const size_t size) {
+    // looks correct
+    extern __shared__ float sdata[];
 
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     int thread_id = threadIdx.x;
 
-    if (idx >= numRows * numCols) {
+    if (idx >= size) {
         return;
     }
 
-    sdata_max[thread_id] = d_logLuminance[idx];
-    sdata_min[thread_id] = d_logLuminance[idx];
+    sdata[thread_id] = d_logLuminance[idx];
     __syncthreads();
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (thread_id < s && (idx + s) < numRows * numCols) {
-            float a_max = sdata_max[thread_id];
-            float b_max = sdata_max[thread_id + s];
-            float a_min = sdata_min[thread_id];
-            float b_min = sdata_min[thread_id + s];
-            if (a_max < b_max) {
-                sdata_max[thread_id] = b_max;
-            } 
-            if (a_min > b_min) {
-                sdata_min[thread_id] = b_min;
+        if (thread_id < s && (idx + s) < size && (thread_id + s) < blockDim.x) {
+            float a = sdata[thread_id];
+            float b = sdata[thread_id + s];
+            if (min_or_max == 1 && a < b) {
+                sdata[thread_id] = b;
+            } else if (min_or_max == 0 && a > b) {
+                sdata[thread_id] = b;
             }
         } 
         __syncthreads();
     }
    
     if (thread_id == 0) {
-        // convert float to unsigned int
-        unsigned long int mask = -(sdata_max[0] >> 31) | 0x80000000;
-        unsigned int max_curr = sdata_max[0] ^ mask;
-        mask = -static_cast<signed long int>(sdata_min[0] >> 31) | 0x80000000;
-        unsigned int min_curr = sdata_min[0] ^ mask;
-        atomicMax(&max_logLumInt, max_curr);
-        atomicMin(&min_logLumInt, min_curr);
+        logLumArr[blockIdx.x] = sdata[0];
     }
+}
+
+float helper_compute_min_max(const float* const d_logLuminance, 
+                            const int min_or_max,
+                            const size_t numRows,
+                            const size_t numCols) {
+    // looks correct
+
+    size_t size = numRows * numCols;
+    const int reduce_blockSize = 512;
+    int reduce_gridSize;
+    float* d_in;
+    float* d_out;
+
+    checkCudaErrors(cudaMalloc(&d_in, sizeof(float) * size));
+    checkCudaErrors(cudaMemcpy(d_in, d_logLuminance, sizeof(float) * size, cudaMemcpyDeviceToDevice));
+
+    while (size > 1) {
+        reduce_gridSize = (size + reduce_blockSize - 1) / reduce_blockSize;
+
+        // Allocate memory for logLum
+        float* d_out;
+        checkCudaErrors(cudaMalloc(&d_out, sizeof(float) * reduce_gridSize));
+
+        // Find the minimum and maximum across the image (reduce)
+        get_logLum_max_min<<<reduce_gridSize, reduce_blockSize, reduce_blockSize * sizeof(float)>>>(d_in,
+                                                                                                    d_out,
+                                                                                                    min_or_max,
+                                                                                                    size);
+
+        cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    
+        // Free memory
+        checkCudaErrors(cudaFree(d_in));
+
+        d_in = d_out;
+        size = reduce_gridSize;
+    }
+
+    float result;
+    checkCudaErrors(cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Free memory
+    checkCudaErrors(cudaFree(d_out));
+
+    return result;
 }
 
 __global__ void compute_histogram(const float* const d_logLuminance, 
@@ -135,6 +169,7 @@ __global__ void compute_histogram(const float* const d_logLuminance,
                        const size_t numCols,
                        const size_t numBins, 
                        unsigned int* logLum_hist) {
+    // Looks correct
 
     const int2 thread_2D_pos = make_int2(blockDim.x * blockIdx.x + threadIdx.x,
                                         blockDim.y * blockIdx.y + threadIdx.y);
@@ -157,8 +192,9 @@ __global__ void compute_cumulative_hist(unsigned int* logLum_hist,
                                         unsigned int* const d_cdf,
                                         const size_t numBins) {
     // Perform exclusive scan (Blelloch scan)
+    // Assume numBins is a multiple of two
     const int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= numBins) {
+    if (2 * idx >= numBins || (2 * idx + 1) >= numBins) {
         return;
     }
 
@@ -219,34 +255,15 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        incoming d_cdf pointer which already has been allocated for you)       */
 
     // Set block size and grid size
-    const int reduce_blockSize = 256;
-    const int reduce_gridSize = (numRows * numCols + 256 - 1) / reduce_blockSize;
-
     const dim3 hist_blockSize(32, 32, 1);
     const dim3 hist_gridSize((numCols + 32 - 1)/32, (numRows + 32 - 1) / 32, 1);
 
     const dim3 scan_blockSize(256, 1, 1);
     const dim3 scan_gridSize((numBins/2 + 256 - 1)/256, 1, 1);
 
-    // Declare and convert min and max to unsigned int
-    unsigned long int mask  = -static_cast<signed long int>(max_logLum >> 31) | 0x80000000;
-    unsigned int max_logLumInt = mask ^ max_logLum;
-    mask = -static_cast<signed long int>(min_logLum >> 31) | 0x80000000;
-    unsigned int min_logLumInt = mask ^ min_logLum;
-
-    // Find the minimum and maximum across the image (reduce)
-    get_logLum_max_min<<<reduce_gridSize, reduce_blockSize, 2 * reduce_blockSize * sizeof(float)>>>(d_logLuminance, 
-                                                                                                &max_logLumInt, 
-                                                                                                &min_logLumInt,
-                                                                                                numRows, 
-                                                                                                numCols);
-    // Convert back to float
-    mask = ((max_logLumInt >> 31) - 1) | 0x80000000;
-    max_logLum = mask ^ max_logLumInt;
-    mask = ((min_logLumInt >> 31) - 1) | 0x80000000;
-    min_logLum = mask ^ min_logLumInt;
-
-    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    // Compute minimum and maximum
+    max_logLum = helper_compute_min_max(d_logLuminance, 1, numRows, numCols);
+    min_logLum = helper_compute_min_max(d_logLuminance, 0, numRows, numCols);
 
     // Allocate memory for histogram
     unsigned int* logLum_hist;
@@ -269,4 +286,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                                                numBins);
 
     cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+    // Free memory
+    checkCudaErrors(cudaFree(logLum_hist));
 }
