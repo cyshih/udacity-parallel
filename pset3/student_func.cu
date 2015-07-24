@@ -22,7 +22,7 @@
 
   The problem is that although we have cameras capable of recording the wide
   range of intensity that exists in the real world our monitors are not capable
-  of displaying them.  Our eyes are also quite capable of observing a much wider
+  of displaying them. Our eyes are also quite capable of observing a much wider
   range of intensities than our image formats / monitors are capable of
   displaying.
 
@@ -80,6 +80,124 @@
 */
 
 #include "utils.h"
+#include <stdint.h>
+
+__global__ void get_logLum_max_min(const float* const d_logLuminance,
+                       unsigned int max_logLumInt, 
+                       unsigned int  min_logLumInt,
+                       const size_t numRows,
+                       const size_t numCols) {
+    extern __shared__ float sdata_max[];
+    extern __shared__ float sdata_min[];
+
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int thread_id = threadIdx.x;
+
+    if (idx >= numRows * numCols) {
+        return;
+    }
+
+    sdata_max[thread_id] = d_logLuminance[idx];
+    sdata_min[thread_id] = d_logLuminance[idx];
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_id < s && (idx + s) < numRows * numCols) {
+            float a_max = sdata_max[thread_id];
+            float b_max = sdata_max[thread_id + s];
+            float a_min = sdata_min[thread_id];
+            float b_min = sdata_min[thread_id + s];
+            if (a_max < b_max) {
+                sdata_max[thread_id] = b_max;
+            } 
+            if (a_min > b_min) {
+                sdata_min[thread_id] = b_min;
+            }
+        } 
+        __syncthreads();
+    }
+   
+    if (thread_id == 0) {
+        // convert float to unsigned int
+        unsigned long int mask = -(sdata_max[0] >> 31) | 0x80000000;
+        unsigned int max_curr = sdata_max[0] ^ mask;
+        mask = -static_cast<signed long int>(sdata_min[0] >> 31) | 0x80000000;
+        unsigned int min_curr = sdata_min[0] ^ mask;
+        atomicMax(&max_logLumInt, max_curr);
+        atomicMin(&min_logLumInt, min_curr);
+    }
+}
+
+__global__ void compute_histogram(const float* const d_logLuminance, 
+                       float min_logLum,
+                       float max_logLum,
+                       const size_t numRows,
+                       const size_t numCols,
+                       const size_t numBins, 
+                       unsigned int* logLum_hist) {
+
+    const int2 thread_2D_pos = make_int2(blockDim.x * blockIdx.x + threadIdx.x,
+                                        blockDim.y * blockIdx.y + threadIdx.y);
+    const int thread_1D_pos = thread_2D_pos.y * numCols + thread_2D_pos.x;
+
+    if (thread_2D_pos.x >= numCols || thread_2D_pos.y >= numRows) {
+        return;
+    }
+    
+    float luminance = d_logLuminance[thread_1D_pos];
+    float logLumRange = max_logLum - min_logLum;
+    unsigned int bin = static_cast<unsigned int>((luminance - min_logLum) / logLumRange * numBins);
+    if (bin > static_cast<unsigned int>(numBins - 1)) {
+        bin = static_cast<unsigned int>(numBins - 1);
+    }
+    atomicAdd(&(logLum_hist[bin]), 1);
+}
+
+__global__ void compute_cumulative_hist(unsigned int* logLum_hist,
+                                        unsigned int* const d_cdf,
+                                        const size_t numBins) {
+    // Perform exclusive scan (Blelloch scan)
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= numBins) {
+        return;
+    }
+
+    extern __shared__ unsigned int tmp[];
+    tmp[2 * idx] = logLum_hist[2 * idx];
+    tmp[2 * idx + 1] = logLum_hist[2 * idx + 1];
+    int offset = 1;
+
+    // Perform upsweep
+    for (int d = numBins >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        if (idx < d) {
+            int index1 = offset * (2 * idx + 1) - 1;
+            int index2 = offset * (2 * idx + 2) - 1;
+            tmp[index2] += tmp[index1];
+        }
+        offset *= 2;
+    }
+
+    // Perform downsweep
+    if (idx == 0) {
+        tmp[numBins - 1] = 0;
+    }
+    for (int d = 1; d < numBins; d *= 2) {
+        offset >>= 1;
+        __syncthreads();
+        if (idx < d) {
+            int index1 = offset * (2 * idx + 1) - 1;
+            int index2 = offset * (2 * idx + 2) - 1;
+
+            unsigned int t = tmp[index1];
+            tmp[index1] = tmp[index2];
+            tmp[index2] += t;
+        }
+    }
+
+    d_cdf[2 * idx] = tmp[2 * idx];
+    d_cdf[2 * idx + 1] = tmp[2 * idx + 1];
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -100,5 +218,55 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+    // Set block size and grid size
+    const int reduce_blockSize = 256;
+    const int reduce_gridSize = (numRows * numCols + 256 - 1) / reduce_blockSize;
 
+    const dim3 hist_blockSize(32, 32, 1);
+    const dim3 hist_gridSize((numCols + 32 - 1)/32, (numRows + 32 - 1) / 32, 1);
+
+    const dim3 scan_blockSize(256, 1, 1);
+    const dim3 scan_gridSize((numBins/2 + 256 - 1)/256, 1, 1);
+
+    // Declare and convert min and max to unsigned int
+    unsigned long int mask  = -static_cast<signed long int>(max_logLum >> 31) | 0x80000000;
+    unsigned int max_logLumInt = mask ^ max_logLum;
+    mask = -static_cast<signed long int>(min_logLum >> 31) | 0x80000000;
+    unsigned int min_logLumInt = mask ^ min_logLum;
+
+    // Find the minimum and maximum across the image (reduce)
+    get_logLum_max_min<<<reduce_gridSize, reduce_blockSize, 2 * reduce_blockSize * sizeof(float)>>>(d_logLuminance, 
+                                                                                                &max_logLumInt, 
+                                                                                                &min_logLumInt,
+                                                                                                numRows, 
+                                                                                                numCols);
+    // Convert back to float
+    mask = ((max_logLumInt >> 31) - 1) | 0x80000000;
+    max_logLum = mask ^ max_logLumInt;
+    mask = ((min_logLumInt >> 31) - 1) | 0x80000000;
+    min_logLum = mask ^ min_logLumInt;
+
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+    // Allocate memory for histogram
+    unsigned int* logLum_hist;
+    checkCudaErrors(cudaMalloc(&logLum_hist, sizeof(unsigned int) * numBins));
+
+    // Build a histogram (atomicAdd)
+    compute_histogram<<<hist_gridSize, hist_blockSize>>>(d_logLuminance, 
+                                               min_logLum,
+                                               max_logLum, 
+                                               numRows, 
+                                               numCols,
+                                               numBins,
+                                               logLum_hist);
+
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+    // Cumulative add (scan)
+    compute_cumulative_hist<<<scan_blockSize, scan_gridSize, sizeof(unsigned int) * numBins>>>(logLum_hist,
+                                                               d_cdf,
+                                                               numBins);
+
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
