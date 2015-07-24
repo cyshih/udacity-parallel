@@ -116,12 +116,12 @@ __global__ void get_logLum_max_min(const float* const d_logLuminance,
     }
 }
 
-float helper_compute_min_max(const float* const d_logLuminance, 
+void helper_compute_min_max(const float* const d_logLuminance, 
                             const int min_or_max,
                             const size_t numRows,
-                            const size_t numCols) {
+                            const size_t numCols,
+                            float &result) {
     // looks correct
-
     size_t size = numRows * numCols;
     const int reduce_blockSize = 512;
     int reduce_gridSize;
@@ -131,11 +131,10 @@ float helper_compute_min_max(const float* const d_logLuminance,
     checkCudaErrors(cudaMalloc(&d_in, sizeof(float) * size));
     checkCudaErrors(cudaMemcpy(d_in, d_logLuminance, sizeof(float) * size, cudaMemcpyDeviceToDevice));
 
-    while (size > 1) {
+    while(true) {
         reduce_gridSize = (size + reduce_blockSize - 1) / reduce_blockSize;
 
         // Allocate memory for logLum
-        float* d_out;
         checkCudaErrors(cudaMalloc(&d_out, sizeof(float) * reduce_gridSize));
 
         // Find the minimum and maximum across the image (reduce)
@@ -149,17 +148,18 @@ float helper_compute_min_max(const float* const d_logLuminance,
         // Free memory
         checkCudaErrors(cudaFree(d_in));
 
+        if (reduce_gridSize == 1) {
+            break;
+        }
+
         d_in = d_out;
         size = reduce_gridSize;
-    }
+    } 
 
-    float result;
     checkCudaErrors(cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost));
     
     // Free memory
     checkCudaErrors(cudaFree(d_out));
-
-    return result;
 }
 
 __global__ void compute_histogram(const float* const d_logLuminance, 
@@ -187,6 +187,35 @@ __global__ void compute_histogram(const float* const d_logLuminance,
     }
     atomicAdd(&(logLum_hist[bin]), 1);
 }
+
+/*__global__ void compute_cumulative_hist_naive(unsigned int* logLum_hist,*/
+/*                                        unsigned int* const d_cdf,*/
+/*                                        const size_t numBins) {*/
+/*    const int idx = blockDim.x * blockIdx.x + threadIdx.x;*/
+/*    if (idx >= numBins) {*/
+/*        return;*/
+/*    }*/
+/**/
+/*    extern __shared__ unsigned int tmp[];*/
+/*    int pout = 0, pin = 1;*/
+/**/
+/*    tmp[pout * numBins + idx] = (idx > 0)? logLum_hist[idx - 1] : 0;*/
+/*    __syncthreads();*/
+/**/
+/*    for (int offset = 1; offset < numBins; offset *= 2) {*/
+/*        pout = 1 - pout;*/
+/*        pin = 1 - pout;*/
+/*        if (idx >= offset) {*/
+/*            tmp[pout * numBins + idx] += tmp[pin * numBins + idx - offset];*/
+/*        } else {*/
+/*            tmp[pout * numBins + idx] += tmp[pin * numBins + idx];*/
+/*        }*/
+/*        __syncthreads();*/
+/*    }*/
+/**/
+/*    d_cdf[idx] = tmp[pout * numBins + idx];        */
+/*}*/
+                                
 
 __global__ void compute_cumulative_hist(unsigned int* logLum_hist,
                                         unsigned int* const d_cdf,
@@ -230,6 +259,7 @@ __global__ void compute_cumulative_hist(unsigned int* logLum_hist,
             tmp[index2] += t;
         }
     }
+    __syncthreads();
 
     d_cdf[2 * idx] = tmp[2 * idx];
     d_cdf[2 * idx + 1] = tmp[2 * idx + 1];
@@ -262,12 +292,13 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     const dim3 scan_gridSize((numBins/2 + 256 - 1)/256, 1, 1);
 
     // Compute minimum and maximum
-    max_logLum = helper_compute_min_max(d_logLuminance, 1, numRows, numCols);
-    min_logLum = helper_compute_min_max(d_logLuminance, 0, numRows, numCols);
+    helper_compute_min_max(d_logLuminance, 1, numRows, numCols, max_logLum);
+    helper_compute_min_max(d_logLuminance, 0, numRows, numCols, min_logLum);
 
     // Allocate memory for histogram
     unsigned int* logLum_hist;
     checkCudaErrors(cudaMalloc(&logLum_hist, sizeof(unsigned int) * numBins));
+    checkCudaErrors(cudaMemset(logLum_hist, 0, sizeof(unsigned int) * numBins));
 
     // Build a histogram (atomicAdd)
     compute_histogram<<<hist_gridSize, hist_blockSize>>>(d_logLuminance, 
