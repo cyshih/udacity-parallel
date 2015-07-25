@@ -42,6 +42,95 @@
 
  */
 
+__global__ compute_histogram(unsigned int* const input,
+                             unsigned int* output,
+                             unsigned int mask,
+                             unsigned int iteration,
+                             const size_t numElems) {
+
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= numElems) {
+        return;
+    }
+    unsigned int bin = (input[idx] & mask) >> iteration;
+    atomicAdd(&(output[1-bin]), 1);
+}
+
+__global__ void compute_cumulative_hist_naive(unsigned int* d_in,
+                                        unsigned int* const d_out,
+                                        const size_t numBins) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= numBins) {
+        return;
+    }
+
+    extern __shared__ unsigned int tmp[];
+    int pout = 0, pin = 1;
+
+    tmp[pout * numBins + idx] = (idx > 0)? d_in[idx - 1] : 0;
+    __syncthreads();
+
+    for (int offset = 1; offset < numBins; offset *= 2) {
+        pout = 1 - pout;
+        pin = 1 - pout;
+        if (idx >= offset) {
+            tmp[pout * numBins + idx] += tmp[pin * numBins + idx - offset];
+        } else {
+            tmp[pout * numBins + idx] += tmp[pin * numBins + idx];
+        }
+        __syncthreads();
+    }
+
+    d_out[idx] = tmp[pout * numBins + idx];        
+}
+
+__global__ void scatter(unsigned int* const d_inputVals,
+                        unsigned int* const d_inputPos,
+                        unsigned int* const d_outputVals,
+                        unsigned int* const d_outputPos,
+                        unsigned int* cum_hist,
+                        const size_t numElems,
+                        const size_t numBins,
+                        unsigned int mask,
+                        unsigned int iteration) {
+
+    int idx = blockDim.x * blockIdx.idx + threadIdx.idx;
+    if (idx >= numElems) {
+        return;
+    }
+    
+    unsigned int bin = (input[idx] & mask) >> iteration;
+    unsigned int last_elem_bin = (input[numElems - 1] & mask) >> iteration;
+    unsigned int total_zeros = cum_hist[numBins - 1] + 1 - last_elem_bin;
+    unsigned int t = idx - cum_hist[idx] + total_zeros;
+
+    unsigned int dst_pos = bin? t : cum_hist[idx];
+
+    d_outputVals[dst_pos] = d_inputVals[idx];
+    d_outputPos[dst_pos] = d_inputPos[idx];
+}
+
+__global__ void complete_one_sort(unsigned int* const d_inputVals,
+                                  unsigned int* const d_inputPos,
+                                  unsigned int* const d_outputVals,
+                                  unsigned int* const d_outputPos,
+                                  const size_t numElems,
+                                  unsigned int* offset,
+                                  unsigned int* cum_hist,
+                                  unsigned int mask,
+                                  unsigned int iteration) {
+
+    int idx = blockDim.x * blockIdx.idx + threadIdx.idx;
+    if (idx >= numElems) {
+        return;
+    }
+
+    unsigned int bin = (d_inputVals[idx] & mask) >> iteration;
+
+    unsigned int dst_pos = offset[idx]; 
+    d_outputVals[dst_pos] = d_inputVals[idx];
+    d_outputPos[dst_pos] = d_inputPos[idx];
+}
 
 void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_inputPos,
@@ -49,6 +138,78 @@ void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_outputPos,
                const size_t numElems)
 { 
-  //TODO
-  //PUT YOUR SORT HERE
+    const int numBits = 1;
+    const int numBins = 1 << numBits;
+
+    // Initialize histogram and cumulative histogram memory
+    unsigned int* hist;
+    unsigned int* cum_hist;
+    /*unsigned int* offset;*/
+    checkCudaErrors(cudaMalloc(hist, sizeof(unsigned int) * numBins));
+    checkCudaErrors(cudaMalloc(cum_hist, sizeof(unsigned int) * numBins));
+    /*checkCudaErrors(cudaMalloc(offset, sizeof(unsigned int) * numElems));*/
+
+    // Compute block and grid size
+    const dim3 hist_blockSize(256, 1, 1);
+    const dim3 hist_gridSize((numElems + 256 - 1)/256, 1, 1);
+    const dim3 scan_blockSize(1, 1, 1);
+    const dim3 scan_gridSize(numBins, 1, 1);
+    const dim3 offset_blockSize(256, 1, 1);
+    const dim3 offset_gridSize((numElems + 256 - 1)/256, 1, 1);
+    const dim3 sort_blockSize(256, 1, 1);
+    const dim3 sort_gridSize((numElems + 256 - 1)/256, 1, 1);
+
+    unsigned int *tmp;
+
+    for (unsigned int i = 0; i < 8 * sizeof(unsigned int); i+= numBits) {
+        unsigned int mask = (numBins - 1) << i;
+        checkCudaErrors(cudaMemset(hist, 0, sizeof(unsigned int) * numBins));
+        checkCudaErrors(cudaMemset(cum_hist, 0, sizeof(unsigned int) * numBins));
+
+        // create histogram of number of occurrences of each digit
+        compute_histogram<<<hist_gridSize, hist_blockSize>>>(d_inputVals, hist, mask, i, numElems);
+        cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+        // exclusive prefix sum of histogram
+        compute_cumulative_hist_naive<<<scan_gridSize, scan_blockSize>>>(hist, cum_hist, numBins);
+        cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+        // determine relative offset of each digit
+        /*checkCudaErrors(cudaMemset(offset, 0, sizeof(unsigned int) * numElems));*/
+        /*compute_relative_offset<<<offset_gridSize, offset_blockSize>>>(d_inputVals,*/
+        /*                                                               offset,*/
+        /*                                                               cum_hist,*/
+        /*                                                               numElems,*/
+        /*                                                               mask,*/
+        /*                                                               iteration);*/
+        /*cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());*/
+
+        scatter<<<sort_gridSize, sort_blockSize>>>(d_inputVals,
+                                                   d_inputPos,
+                                                   d_outputVals,
+                                                   d_outputPos,
+                                                   cum_hist,
+                                                   numElems,
+                                                   numBins,
+                                                   mask,
+                                                   iteration);
+        cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+        
+        // Swap input and output
+        tmp = d_outputVals;
+        d_outputVals = d_inputVals;
+        d_inputVals = tmp;
+
+        tmp = d_outputPos;
+        d_outputPos = d_inputPos;
+        d_inputPos = tmp;
+    }
+
+    // Swap input and output
+    checkCudaErrors(cudaMemcpy(d_outputVals, d_inputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice));
+    checkCudaErrors(cudaMemcpy(d_outputPos, d_inputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice));
+
+    // Free memory
+    checkCudaErrors(cudaFree(hist));
+    checkCudaErrors(cudaFree(cum_hist));
 }
